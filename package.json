@@ -46,6 +46,23 @@
           "type": "string",
           "default": "src/debug-replayer.ts",
           "description": "Specifies which file will be used to start a replayer process."
+        },
+        "temporal.debugLanguage": {
+          "type": "string",
+          "enum": [
+            "typescript",
+            "go",
+            "java",
+            "python"
+          ],
+          "default": "typescript",
+          "description": "Specifies the programming language to use for debugging workflows.",
+          "enumDescriptions": [
+            "TypeScript/JavaScript with Node.js runtime",
+            "Go with delve debugger",
+            "Java with built-in debugger",
+            "Python with built-in debugger"
+          ]
         }
       }
     }

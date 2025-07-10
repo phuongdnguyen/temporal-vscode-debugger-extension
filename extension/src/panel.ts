@@ -6,7 +6,7 @@ import { historyFromJSON } from "@temporalio/common/lib/proto-utils"
 import { temporal } from "@temporalio/proto"
 import { Connection, LOCAL_TARGET } from "@temporalio/client"
 import { Server } from "./server"
-import { getBaseConfiguration } from "./get-base-configuration"
+import { getBaseConfiguration, getCurrentLanguage } from "./get-base-configuration"
 
 interface StartFromId {
   namespace?: string
@@ -253,9 +253,38 @@ export class HistoryDebuggerPanel {
   private async getReplayerEndpoint() {
     const config = vscode.workspace.getConfiguration("temporal")
     let replayerEntrypoint = config.get("replayerEntrypoint") as string
+    const language = getCurrentLanguage()
     const workspace = vscode.workspace.workspaceFolders?.[0]
     const workspaceFolder = workspace?.uri
+
+    // Debug logging
+    console.log("Debug configuration:")
+    console.log("- Language:", language)
+    console.log("- Configured replayerEntrypoint:", replayerEntrypoint)
+    console.log("- Workspace folder:", workspaceFolder?.fsPath)
+    console.log("- All temporal config:", config)
+
     const configuredAbsolutePath = path.isAbsolute(replayerEntrypoint)
+
+    // Provide language-specific defaults if not configured
+    if (!replayerEntrypoint) {
+      switch (language) {
+        case "typescript":
+          replayerEntrypoint = "src/debug-replayer.ts"
+          break
+        case "go":
+          replayerEntrypoint = "." // Use current directory for Go package
+          break
+        case "java":
+          replayerEntrypoint = "src/main/java/TemporalReplayer.java"
+          break
+        case "python":
+          replayerEntrypoint = "replayer.py"
+          break
+        default:
+          throw new Error(`No default replayer endpoint for language: ${language}`)
+      }
+    }
 
     if (!configuredAbsolutePath) {
       if (workspaceFolder === undefined) {
@@ -293,6 +322,21 @@ export class HistoryDebuggerPanel {
     return replayerEntrypoint
   }
 
+  private getLanguageRequirements(language: string): string {
+    switch (language) {
+      case "typescript":
+        return "Make sure you have the TypeScript extension installed and ts-node available."
+      case "go":
+        return "Make sure you have the Go extension installed and delve debugger available."
+      case "java":
+        return "Make sure you have the Java extension pack installed."
+      case "python":
+        return "Make sure you have the Python extension installed."
+      default:
+        return "Unknown language requirements."
+    }
+  }
+
   /* eslint-disable @typescript-eslint/naming-convention */
   private async handleStartProject(history: temporal.api.history.v1.IHistory): Promise<void> {
     const bytes = new Uint8Array(temporal.api.history.v1.History.encode(history).finish())
@@ -300,6 +344,7 @@ export class HistoryDebuggerPanel {
     this.currentHistoryBuffer = buffer
     const workspace = vscode.workspace.workspaceFolders?.[0]
     const replayerEndpoint = await this.getReplayerEndpoint()
+    const language = getCurrentLanguage()
 
     await this.panel.webview.postMessage({ type: "historyProcessed", history: bytes })
     // Make sure the panel is out of focus before starting a debug session, otherwise it will be replaced with an
@@ -311,25 +356,85 @@ export class HistoryDebuggerPanel {
     }
 
     const baseConfig = await getBaseConfiguration()
-    // So this can be used with the TypeScript SDK
-    if (process.env.TEMPORAL_DEBUGGER_EXTENSION_DEV_MODE) {
-      baseConfig.skipFiles.push("${workspaceFolder}/packages/worker/src/**")
+
+    // Language-specific configuration
+    let debugConfig: vscode.DebugConfiguration
+
+    switch (language) {
+      case "typescript":
+        // TypeScript-specific configuration
+        if (process.env.TEMPORAL_DEBUGGER_EXTENSION_DEV_MODE) {
+          baseConfig.skipFiles?.push("${workspaceFolder}/packages/worker/src/**")
+        }
+        // NOTE: Adding NODE_PATH below in case ts-node is not an installed dependency in the workspace.
+        const delim = os.platform() === "win32" ? ";" : ":"
+        const pathPrefix = process.env.NODE_PATH ? `${process.env.NODE_PATH ?? ""}${delim}` : ""
+        debugConfig = {
+          ...baseConfig,
+          args: [replayerEndpoint],
+          env: {
+            TEMPORAL_DEBUGGER_PLUGIN_URL: this.server.url,
+            NODE_PATH: `${pathPrefix}${path.join(__dirname, "../../node_modules")}`,
+          },
+        }
+        break
+
+      case "go":
+        // For Go, ensure we have a valid program path
+        let goProgram = replayerEndpoint
+        if (goProgram.endsWith('.go')) {
+          // If it's a .go file, use it directly
+          goProgram = replayerEndpoint
+        } else {
+          // If it's a directory, use the directory path
+          goProgram = path.dirname(replayerEndpoint)
+        }
+        console.log("Go program path:", goProgram)
+
+        debugConfig = {
+          ...baseConfig,
+          program: goProgram,
+          env: {
+            TEMPORAL_DEBUGGER_PLUGIN_URL: this.server.url,
+          },
+        }
+        break
+
+      case "java":
+        debugConfig = {
+          ...baseConfig,
+          args: [replayerEndpoint],
+          env: {
+            TEMPORAL_DEBUGGER_PLUGIN_URL: this.server.url,
+          },
+        }
+        break
+
+      case "python":
+        debugConfig = {
+          ...baseConfig,
+          args: [replayerEndpoint],
+          env: {
+            TEMPORAL_DEBUGGER_PLUGIN_URL: this.server.url,
+          },
+        }
+        break
+
+      default:
+        throw new Error(`Unsupported language: ${language}`)
     }
-    // NOTE: Adding NODE_PATH below in case ts-node is not an installed dependency in the workspace.
-    // From https://nodejs.org/api/modules.html#loading-from-the-global-folders:
-    // > Node.js will search those paths for modules **if they are not found elsewhere**.
-    // Our NODE_PATH will only be used as a fallback which is what we want.
-    const delim = os.platform() === "win32" ? ";" : ":"
-    const pathPrefix = process.env.NODE_PATH ? `${process.env.NODE_PATH ?? ""}${delim}` : ""
-    await vscode.debug.startDebugging(workspace, {
-      ...baseConfig,
-      args: [replayerEndpoint],
-      env: {
-        TEMPORAL_DEBUGGER_PLUGIN_URL: this.server.url,
-        NODE_PATH: `${pathPrefix}${path.join(__dirname, "../../node_modules")}`,
-      },
-    })
-    await vscode.window.showInformationMessage("Starting debug session")
+
+    try {
+      console.log("Final debug configuration:", JSON.stringify(debugConfig, null, 2))
+      await vscode.debug.startDebugging(workspace, debugConfig)
+      await vscode.window.showInformationMessage(`Starting ${language} debug session`)
+    } catch (err) {
+      const requirements = this.getLanguageRequirements(language)
+      await vscode.window.showErrorMessage(
+        `Failed to start ${language} debug session: ${err}\n\n${requirements}`,
+      )
+      throw err
+    }
   }
 
   private getHtmlForWebview(webview: vscode.Webview): string {
